@@ -15,7 +15,8 @@ const IS_VERCEL = process.env.VERCEL === "1";
 const STORAGE_BASE = IS_VERCEL ? "/tmp" : process.cwd();
 
 const DATA_FILE = path.join(STORAGE_BASE, "data.json");
-const FONTS_DIR = path.join(STORAGE_BASE, "public", "fonts");
+const PROJECT_FONTS_DIR = path.join(process.cwd(), "font");
+const WRITABLE_FONTS_DIR = path.join(STORAGE_BASE, "public", "fonts");
 const UPLOADS_DIR = path.join(STORAGE_BASE, "public", "uploads");
 
 // Database setup
@@ -37,7 +38,7 @@ let isDbInitialized = false;
 let dbInitError: string | null = null;
 
 // Ensure directories exist
-[FONTS_DIR, UPLOADS_DIR].forEach(dir => {
+[WRITABLE_FONTS_DIR, UPLOADS_DIR].forEach(dir => {
   try {
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -121,7 +122,7 @@ if (!fs.existsSync(DATA_FILE)) {
 const storage = multer.diskStorage({
   destination: (req, file, cb) => {
     const isFont = file.fieldname === 'font';
-    cb(null, isFont ? FONTS_DIR : UPLOADS_DIR);
+    cb(null, isFont ? WRITABLE_FONTS_DIR : UPLOADS_DIR);
   },
   filename: (req, file, cb) => {
     const sanitized = file.originalname.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
@@ -160,7 +161,8 @@ app.get("/api/health", async (req, res) => {
   });
 });
 
-app.use("/fonts", express.static(FONTS_DIR));
+app.use("/fonts", express.static(PROJECT_FONTS_DIR));
+app.use("/fonts", express.static(WRITABLE_FONTS_DIR));
 app.use("/uploads", express.static(UPLOADS_DIR));
 
 // Auth
@@ -412,8 +414,10 @@ app.post("/api/user/preferences", async (req, res) => {
 // Fonts
 app.get("/api/fonts", (req, res) => {
   try {
-    const files = fs.readdirSync(FONTS_DIR);
-    res.json(files.map(f => ({ name: f, url: `/fonts/${f}` })));
+    const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
+    const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
+    const allFiles = Array.from(new Set([...projectFiles, ...writableFiles]));
+    res.json(allFiles.map(f => ({ name: f, url: `/fonts/${f}` })));
   } catch (err) {
     console.error("Fetch fonts error:", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -432,8 +436,11 @@ app.post("/api/upload-font", (req, res, next) => {
 app.delete("/api/fonts/:name", (req, res) => {
   try {
     const { name } = req.params;
-    const files = fs.readdirSync(FONTS_DIR);
-    const fileToDelete = files.find(f => {
+    const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
+    const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
+    
+    // Check writable files first as they are more likely to be deleted
+    let fileToDelete = writableFiles.find(f => {
       const parts = f.split('-');
       const nameWithExt = parts.length > 1 ? parts.slice(1).join('-') : f;
       const fontFamily = nameWithExt.split('.').slice(0, -1).join('.');
@@ -441,7 +448,20 @@ app.delete("/api/fonts/:name", (req, res) => {
     });
 
     if (fileToDelete) {
-      fs.unlinkSync(path.join(FONTS_DIR, fileToDelete));
+      fs.unlinkSync(path.join(WRITABLE_FONTS_DIR, fileToDelete));
+      return res.json({ success: true });
+    }
+
+    // Check project files (might fail if read-only)
+    fileToDelete = projectFiles.find(f => {
+      const parts = f.split('-');
+      const nameWithExt = parts.length > 1 ? parts.slice(1).join('-') : f;
+      const fontFamily = nameWithExt.split('.').slice(0, -1).join('.');
+      return fontFamily === name || f === name;
+    });
+
+    if (fileToDelete) {
+      fs.unlinkSync(path.join(PROJECT_FONTS_DIR, fileToDelete));
       res.json({ success: true });
     } else {
       res.status(404).json({ success: false, message: "Font not found" });
@@ -455,8 +475,10 @@ app.delete("/api/fonts/:name", (req, res) => {
 app.post("/api/fonts/rename", (req, res) => {
   try {
     const { oldName, newName } = req.body;
-    const files = fs.readdirSync(FONTS_DIR);
-    const fileToRename = files.find(f => {
+    const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
+    const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
+    
+    let fileToRename = writableFiles.find(f => {
       const parts = f.split('-');
       const nameWithExt = parts.length > 1 ? parts.slice(1).join('-') : f;
       const fontFamily = nameWithExt.split('.').slice(0, -1).join('.');
@@ -467,7 +489,22 @@ app.post("/api/fonts/rename", (req, res) => {
       const ext = path.extname(fileToRename);
       const timestamp = fileToRename.split('-')[0];
       const newFileName = `${timestamp}-${newName}${ext}`;
-      fs.renameSync(path.join(FONTS_DIR, fileToRename), path.join(FONTS_DIR, newFileName));
+      fs.renameSync(path.join(WRITABLE_FONTS_DIR, fileToRename), path.join(WRITABLE_FONTS_DIR, newFileName));
+      return res.json({ success: true });
+    }
+
+    fileToRename = projectFiles.find(f => {
+      const parts = f.split('-');
+      const nameWithExt = parts.length > 1 ? parts.slice(1).join('-') : f;
+      const fontFamily = nameWithExt.split('.').slice(0, -1).join('.');
+      return fontFamily === oldName || f === oldName;
+    });
+
+    if (fileToRename) {
+      const ext = path.extname(fileToRename);
+      const timestamp = fileToRename.split('-')[0];
+      const newFileName = `${timestamp}-${newName}${ext}`;
+      fs.renameSync(path.join(PROJECT_FONTS_DIR, fileToRename), path.join(PROJECT_FONTS_DIR, newFileName));
       res.json({ success: true });
     } else {
       res.status(404).json({ success: false, message: "Font not found" });
