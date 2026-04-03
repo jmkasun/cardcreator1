@@ -135,16 +135,21 @@ export default function App() {
       const data = await res.json();
       console.log(`API returned ${data.length} fonts:`, data);
       
-      const loadedFonts = await Promise.all(data.map(async (font: Font) => {
-        // Use full filename (minus extension) as fontFamily to ensure uniqueness
+      // Map API data to Font objects with cleaned names for the UI
+      const apiFonts = data.map((font: any) => {
         const fontFamily = font.name.split('.').slice(0, -1).join('.');
+        return { name: fontFamily, url: font.url };
+      });
+      
+      // Set fonts immediately so they show up in the list
+      setFonts(apiFonts);
+      
+      // Load fonts in the background
+      apiFonts.forEach(async (font: any) => {
+        const fontFamily = font.name;
         
-        console.log(`Loading font: "${fontFamily}" from ${font.url}`);
-        
-        // Check if already loaded
         if (Array.from(document.fonts.values()).some(face => face.family === fontFamily)) {
-          console.log(`Font "${fontFamily}" already in document.fonts`);
-          return { name: fontFamily, url: font.url };
+          return;
         }
 
         try {
@@ -152,16 +157,10 @@ export default function App() {
           const loadedFace = await fontFace.load();
           document.fonts.add(loadedFace);
           console.log(`Successfully loaded font: "${fontFamily}"`);
-          return { name: fontFamily, url: font.url };
         } catch (e) {
           console.error(`Failed to load font: "${fontFamily}" from ${font.url}`, e);
-          return null;
         }
-      }));
-      
-      const filteredFonts = loadedFonts.filter(f => f !== null) as Font[];
-      console.log(`Successfully loaded ${filteredFonts.length} fonts into browser:`, filteredFonts.map(f => f.name));
-      setFonts(filteredFonts);
+      });
     } catch (err) {
       console.error("Failed to fetch fonts", err);
     }

@@ -18,26 +18,25 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 // Use /tmp for writable storage on Vercel (fallback if DB not used)
 const IS_VERCEL = process.env.VERCEL === "1";
 const STORAGE_BASE = IS_VERCEL ? "/tmp" : process.cwd();
+const DATA_FILE = path.resolve(STORAGE_BASE, "data.json");
 
-const DATA_FILE = path.join(STORAGE_BASE, "data.json");
+const PROJECT_FONTS_DIR = [
+  path.join(process.cwd(), "api", "font"),
+  path.join(__dirname, "font"),
+  path.join(process.cwd(), "font"),
+  "/var/task/api/font",
+  "/var/task/font"
+].find(dir => fs.existsSync(dir)) || path.join(process.cwd(), "api", "font");
+
+const WRITABLE_FONTS_DIR = path.resolve(STORAGE_BASE, "public", "fonts");
+const UPLOADS_DIR = path.resolve(STORAGE_BASE, "public", "uploads");
+
 console.log(`__dirname: ${__dirname}`);
 console.log(`process.cwd(): ${process.cwd()}`);
-const PROJECT_FONTS_DIR = fs.existsSync(path.join(__dirname, "font")) 
-  ? path.join(__dirname, "font") 
-  : fs.existsSync(path.join(process.cwd(), "api", "font"))
-    ? path.join(process.cwd(), "api", "font")
-    : path.join(process.cwd(), "font");
-
+console.log(`Resolved PROJECT_FONTS_DIR: ${PROJECT_FONTS_DIR} (exists: ${fs.existsSync(PROJECT_FONTS_DIR)})`);
 if (fs.existsSync(PROJECT_FONTS_DIR)) {
   console.log(`Files in PROJECT_FONTS_DIR: ${fs.readdirSync(PROJECT_FONTS_DIR).join(", ")}`);
-} else {
-  console.log(`PROJECT_FONTS_DIR does not exist: ${PROJECT_FONTS_DIR}`);
 }
-
-const WRITABLE_FONTS_DIR = path.join(STORAGE_BASE, "public", "fonts");
-const UPLOADS_DIR = path.join(STORAGE_BASE, "public", "uploads");
-
-console.log(`Fonts directory: ${PROJECT_FONTS_DIR} (exists: ${fs.existsSync(PROJECT_FONTS_DIR)})`);
 
 // Database setup
 if (process.env.DATABASE_URL) {
