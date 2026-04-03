@@ -22,9 +22,11 @@ const STORAGE_BASE = IS_VERCEL ? "/tmp" : process.cwd();
 const DATA_FILE = path.join(STORAGE_BASE, "data.json");
 console.log(`__dirname: ${__dirname}`);
 console.log(`process.cwd(): ${process.cwd()}`);
-const PROJECT_FONTS_DIR = fs.existsSync(path.join(process.cwd(), "public", "fonts")) 
-  ? path.join(process.cwd(), "public", "fonts") 
-  : path.join(__dirname, "font");
+const PROJECT_FONTS_DIR = fs.existsSync(path.join(__dirname, "font")) 
+  ? path.join(__dirname, "font") 
+  : fs.existsSync(path.join(process.cwd(), "api", "font"))
+    ? path.join(process.cwd(), "api", "font")
+    : path.join(process.cwd(), "font");
 
 if (fs.existsSync(PROJECT_FONTS_DIR)) {
   console.log(`Files in PROJECT_FONTS_DIR: ${fs.readdirSync(PROJECT_FONTS_DIR).join(", ")}`);
@@ -191,14 +193,19 @@ app.use("/uploads", express.static(UPLOADS_DIR));
 // Explicit font serving route for Vercel
 app.get("/fonts/:name", (req, res) => {
   const { name } = req.params;
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   const projectPath = path.join(PROJECT_FONTS_DIR, name);
   const writablePath = path.join(WRITABLE_FONTS_DIR, name);
+  const fallbackPath = path.join(process.cwd(), "api", "font", name);
   
   if (fs.existsSync(projectPath)) {
     return res.sendFile(projectPath);
   }
   if (fs.existsSync(writablePath)) {
     return res.sendFile(writablePath);
+  }
+  if (fs.existsSync(fallbackPath)) {
+    return res.sendFile(fallbackPath);
   }
   res.status(404).send("Font not found");
 });
@@ -449,8 +456,27 @@ app.post("/api/user/preferences", async (req, res) => {
   }
 });
 
+app.get("/api/debug-fs", (req, res) => {
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  const debugInfo = {
+    __dirname,
+    cwd: process.cwd(),
+    PROJECT_FONTS_DIR,
+    WRITABLE_FONTS_DIR,
+    projectFontsExist: fs.existsSync(PROJECT_FONTS_DIR),
+    projectFonts: fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [],
+    writableFontsExist: fs.existsSync(WRITABLE_FONTS_DIR),
+    writableFonts: fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [],
+    apiFontDir: path.join(process.cwd(), "api", "font"),
+    apiFontDirExists: fs.existsSync(path.join(process.cwd(), "api", "font")),
+    apiFontDirFiles: fs.existsSync(path.join(process.cwd(), "api", "font")) ? fs.readdirSync(path.join(process.cwd(), "api", "font")) : []
+  };
+  res.json(debugInfo);
+});
+
 // Fonts
 app.get("/api/fonts", (req, res) => {
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   try {
     const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
     const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];

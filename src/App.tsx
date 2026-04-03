@@ -142,6 +142,10 @@ export default function App() {
         const fontFamily = nameWithExt.split('.').slice(0, -1).join('.');
         
         console.log(`Loading font: ${fontFamily} from ${font.url}`);
+        if (document.fonts.check(`12px "${fontFamily}"`)) {
+          console.log(`Font ${fontFamily} already loaded`);
+          return { name: fontFamily, url: font.url };
+        }
         const fontFace = new FontFace(fontFamily, `url("${encodeURI(font.url)}")`);
         try {
           const loadedFace = await fontFace.load();
@@ -149,7 +153,7 @@ export default function App() {
           console.log(`Successfully loaded font: ${fontFamily}`);
           return { name: fontFamily, url: font.url };
         } catch (e) {
-          console.error(`Failed to load font: ${font.name} (${fontFamily})`, e);
+          console.error(`Failed to load font: ${font.name} (${fontFamily}) from ${font.url}`, e);
           return null;
         }
       }));
@@ -738,7 +742,7 @@ export default function App() {
 
   useEffect(() => {
     drawCanvas();
-  }, [image, layers]);
+  }, [image, layers, fonts]);
 
   // Auto-save effect
   useEffect(() => {
