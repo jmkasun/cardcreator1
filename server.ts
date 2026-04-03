@@ -1,15 +1,21 @@
+import "dotenv/config";
 import express from "express";
 import { createServer as createViteServer } from "vite";
 import path from "path";
 import fs from "fs";
 import { fileURLToPath } from "url";
 import multer from "multer";
+import pg from "pg";
+
+// Force bypass for self-signed certificates globally as a fallback
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
+
+const { Pool } = pg;
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const DATA_FILE = path.join(__dirname, "data.json");
-const FONTS_DIR = path.join(__dirname, "public", "fonts");
+const FONTS_DIR = path.join(process.cwd(), "font");
 const UPLOADS_DIR = path.join(__dirname, "public", "uploads");
 
 // Ensure directories exist
@@ -19,14 +25,74 @@ const UPLOADS_DIR = path.join(__dirname, "public", "uploads");
   }
 });
 
-// Initialize data file if not exists
-if (!fs.existsSync(DATA_FILE)) {
-  fs.writeFileSync(DATA_FILE, JSON.stringify({
-    users: [
-      { username: "admin", password: "1234", role: "admin" }
-    ],
-    images: []
-  }, null, 2));
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
+});
+
+if (!process.env.DATABASE_URL) {
+  console.warn("WARNING: DATABASE_URL is not set. Database operations will fail.");
+} else {
+  console.log("DATABASE_URL is set. Length:", process.env.DATABASE_URL.length);
+}
+
+async function initDb() {
+  console.log("Initializing database...");
+  let client;
+  try {
+    client = await pool.connect();
+    console.log("Database connected successfully.");
+  } catch (err) {
+    console.error("CRITICAL: Failed to connect to database:", err instanceof Error ? err.message : String(err));
+    return;
+  }
+
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        username TEXT PRIMARY KEY,
+        password TEXT NOT NULL,
+        role TEXT NOT NULL DEFAULT 'user',
+        selected_fonts TEXT[] DEFAULT '{}'
+      );
+    `);
+    
+    // Ensure column exists if table was created before this version
+    await client.query(`
+      ALTER TABLE users ADD COLUMN IF NOT EXISTS selected_fonts TEXT[] DEFAULT '{}';
+    `);
+
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS font_app_images (
+        id TEXT PRIMARY KEY,
+        username TEXT NOT NULL,
+        image_url TEXT NOT NULL,
+        layers JSONB NOT NULL,
+        name TEXT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Ensure column exists for images too
+    await client.query(`
+      ALTER TABLE font_app_images ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP;
+    `);
+    
+    const adminCheck = await client.query("SELECT * FROM users WHERE username = 'admin'");
+    if (adminCheck.rowCount === 0) {
+      await client.query("INSERT INTO users (username, password, role) VALUES ('admin', 'admin@1234', 'admin')");
+      console.log("Default admin user created.");
+    } else {
+      // Update password if it's the default one and needs changing
+      await client.query("UPDATE users SET password = 'admin@1234' WHERE username = 'admin' AND password = '1234'");
+    }
+  } catch (err) {
+    console.error("Database initialization error:", err);
+  } finally {
+    client.release();
+  }
 }
 
 const storage = multer.diskStorage({
@@ -67,28 +133,32 @@ async function startServer() {
   app.use("/uploads", express.static(UPLOADS_DIR));
 
   // Auth
-  app.post("/api/login", (req, res) => {
+  app.post("/api/login", async (req, res) => {
     try {
       const { username, password } = req.body;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const user = data.users.find((u: any) => u.username === username && u.password === password);
-      if (user) {
+      const result = await pool.query(
+        "SELECT username, role, selected_fonts as \"selectedFonts\" FROM users WHERE username = $1 AND password = $2",
+        [username, password]
+      );
+      
+      if (result.rowCount && result.rowCount > 0) {
+        const user = result.rows[0];
         res.json({ 
           success: true, 
           username: user.username, 
-          role: user.role || (user.username === 'admin' ? 'admin' : 'user'),
+          role: user.role,
           selectedFonts: user.selectedFonts || []
         });
       } else {
         res.status(401).json({ success: false, message: "Invalid credentials" });
       }
     } catch (err) {
-      console.error("Login error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Login error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Database query failed" });
     }
   });
 
-  app.post("/api/v1/update", (req, res) => {
+  app.post("/api/v1/update", async (req, res) => {
     try {
       const authHeader = req.headers['x-sync-auth'];
       if (!authHeader || typeof authHeader !== 'string') {
@@ -101,8 +171,8 @@ async function startServer() {
       
       console.log(`Sync operation: op=${op}, action=${a}, target=${id}`);
 
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const admin = data.users.find((u: any) => u.username === op);
+      const adminResult = await pool.query("SELECT * FROM users WHERE username = $1", [op]);
+      const admin = adminResult.rows[0];
       
       if (!admin || admin.role !== "admin") {
         console.error(`Unauthorized access attempt by ${op}`);
@@ -110,31 +180,46 @@ async function startServer() {
       }
 
       if (a === 'l') { // list
-        const users = data.users.map((u: any) => ({ 
-          username: u.username, 
-          role: u.role || (u.username === 'admin' ? 'admin' : 'user') 
-        }));
-        return res.json({ success: true, users });
+        const usersResult = await pool.query("SELECT username, role FROM users");
+        return res.json({ success: true, users: usersResult.rows });
       }
 
       if (a === 'c') { // create
-        if (data.users.find((u: any) => u.username === id)) {
+        const checkResult = await pool.query("SELECT * FROM users WHERE username = $1", [id]);
+        if (checkResult.rowCount && checkResult.rowCount > 0) {
           return res.status(400).json({ success: false, message: "User already exists" });
         }
-        data.users.push({ username: id, password: c, role: t || "user" });
-        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        await pool.query(
+          "INSERT INTO users (username, password, role) VALUES ($1, $2, $3)",
+          [id, c, t || "user"]
+        );
         console.log(`User created: ${id}`);
         return res.json({ success: true });
       }
 
       if (a === 'u') { // update
-        const userIndex = data.users.findIndex((u: any) => u.username === id);
-        if (userIndex === -1) {
-          return res.status(404).json({ success: false, message: "User not found" });
+        const updateFields = [];
+        const values = [];
+        let paramIndex = 1;
+
+        if (c) {
+          updateFields.push(`password = $${paramIndex++}`);
+          values.push(c);
         }
-        if (c) data.users[userIndex].password = c;
-        if (t) data.users[userIndex].role = t;
-        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        if (t) {
+          updateFields.push(`role = $${paramIndex++}`);
+          values.push(t);
+        }
+
+        if (updateFields.length === 0) {
+          return res.status(400).json({ success: false, message: "No fields to update" });
+        }
+
+        values.push(id);
+        await pool.query(
+          `UPDATE users SET ${updateFields.join(", ")} WHERE username = $${paramIndex}`,
+          values
+        );
         console.log(`User updated: ${id}`);
         return res.json({ success: true });
       }
@@ -143,54 +228,53 @@ async function startServer() {
         if (id === "admin") {
           return res.status(400).json({ success: false, message: "Cannot delete default admin" });
         }
-        data.users = data.users.filter((u: any) => u.username !== id);
-        fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+        await pool.query("DELETE FROM users WHERE username = $1", [id]);
         console.log(`User deleted: ${id}`);
         return res.json({ success: true });
       }
 
       res.status(400).json({ success: false, message: "Invalid action" });
     } catch (err) {
-      console.error("Sync error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Sync error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Sync operation failed" });
     }
   });
 
-  app.post("/api/change-password", (req, res) => {
+  app.post("/api/change-password", async (req, res) => {
     try {
       const { username, oldPassword, newPassword } = req.body;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const userIndex = data.users.findIndex((u: any) => u.username === username && u.password === oldPassword);
+      const result = await pool.query(
+        "UPDATE users SET password = $1 WHERE username = $2 AND password = $3",
+        [newPassword, username, oldPassword]
+      );
       
-      if (userIndex === -1) {
+      if (result.rowCount === 0) {
         return res.status(401).json({ success: false, message: "Invalid old password" });
       }
 
-      data.users[userIndex].password = newPassword;
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
       res.json({ success: true });
     } catch (err) {
-      console.error("Change password error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Change password error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Password update failed" });
     }
   });
 
-  app.post("/api/user/preferences", (req, res) => {
+  app.post("/api/user/preferences", async (req, res) => {
     try {
       const { username, selectedFonts } = req.body;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const userIndex = data.users.findIndex((u: any) => u.username === username);
+      const result = await pool.query(
+        "UPDATE users SET selected_fonts = $1 WHERE username = $2",
+        [selectedFonts, username]
+      );
       
-      if (userIndex === -1) {
+      if (result.rowCount === 0) {
         return res.status(404).json({ success: false, message: "User not found" });
       }
 
-      data.users[userIndex].selectedFonts = selectedFonts;
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
       res.json({ success: true });
     } catch (err) {
-      console.error("Update preferences error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Update preferences error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Preferences update failed" });
     }
   });
 
@@ -200,8 +284,8 @@ async function startServer() {
       const files = fs.readdirSync(FONTS_DIR);
       res.json(files.map(f => ({ name: f, url: `/fonts/${f}` })));
     } catch (err) {
-      console.error("Fetch fonts error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Fetch fonts error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Font retrieval failed" });
     }
   });
 
@@ -265,50 +349,55 @@ async function startServer() {
   });
 
   // Images Metadata
-  app.get("/api/images", (req, res) => {
+  app.get("/api/images", async (req, res) => {
     try {
       const { username } = req.query;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const userImages = username 
-        ? data.images.filter((img: any) => img.username === username)
-        : data.images;
-      res.json(userImages);
-    } catch (err) {
-      console.error("Fetch images error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
-    }
-  });
-
-  app.post("/api/images", (req, res) => {
-    try {
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      const project = req.body; // { id, username, imageUrl, layers, name }
+      let query = "SELECT id, username, image_url as \"imageUrl\", layers, name, created_at as \"createdAt\" FROM font_app_images";
+      const params = [];
       
-      const index = data.images.findIndex((img: any) => img.id === project.id);
-      if (index !== -1) {
-        data.images[index] = project;
-      } else {
-        data.images.push(project);
+      if (username) {
+        query += " WHERE username = $1";
+        params.push(username);
       }
       
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-      res.json({ success: true });
+      const result = await pool.query(query, params);
+      res.json(result.rows);
     } catch (err) {
-      console.error("Save image error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Fetch images error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Image retrieval failed" });
     }
   });
 
-  app.delete("/api/images/:id", (req, res) => {
+  app.post("/api/images", async (req, res) => {
     try {
-      const { id } = req.params;
-      const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
-      data.images = data.images.filter((img: any) => img.id !== id);
-      fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
+      const { id, username, imageUrl, layers, name } = req.body;
+      
+      await pool.query(
+        `INSERT INTO font_app_images (id, username, image_url, layers, name)
+         VALUES ($1, $2, $3, $4, $5)
+         ON CONFLICT (id) DO UPDATE SET
+         username = EXCLUDED.username,
+         image_url = EXCLUDED.image_url,
+         layers = EXCLUDED.layers,
+         name = EXCLUDED.name`,
+        [id, username, imageUrl, JSON.stringify(layers), name]
+      );
+      
       res.json({ success: true });
     } catch (err) {
-      console.error("Delete image error:", err);
-      res.status(500).json({ success: false, message: "Internal server error" });
+      console.error("Save image error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Image save failed" });
+    }
+  });
+
+  app.delete("/api/images/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      await pool.query("DELETE FROM font_app_images WHERE id = $1", [id]);
+      res.json({ success: true });
+    } catch (err) {
+      console.error("Delete image error details:", err instanceof Error ? err.message : String(err));
+      res.status(500).json({ success: false, message: "Internal server error: Image deletion failed" });
     }
   });
 
@@ -348,7 +437,8 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  app.listen(PORT, "0.0.0.0", async () => {
+    await initDb();
     console.log(`Server running on http://0.0.0.0:${PORT}`);
   });
 }
