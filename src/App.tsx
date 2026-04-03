@@ -128,6 +128,10 @@ export default function App() {
     try {
       console.log("Fetching fonts from API...");
       const res = await fetch("/api/fonts");
+      if (!res.ok) {
+        console.error(`Failed to fetch fonts: ${res.status} ${res.statusText}`);
+        return;
+      }
       const data = await res.json();
       console.log(`API returned ${data.length} fonts:`, data);
       
@@ -145,13 +149,13 @@ export default function App() {
           console.log(`Successfully loaded font: ${fontFamily}`);
           return { name: fontFamily, url: font.url };
         } catch (e) {
-          console.error(`Failed to load font: ${font.name}`, e);
+          console.error(`Failed to load font: ${font.name} (${fontFamily})`, e);
           return null;
         }
       }));
       
       const filteredFonts = loadedFonts.filter(f => f !== null) as Font[];
-      console.log(`Successfully loaded ${filteredFonts.length} fonts into browser.`);
+      console.log(`Successfully loaded ${filteredFonts.length} fonts into browser:`, filteredFonts.map(f => f.name));
       setFonts(filteredFonts);
     } catch (err) {
       console.error("Failed to fetch fonts", err);
@@ -1699,6 +1703,44 @@ export default function App() {
                             />
                           </div>
                           <div className="flex items-center gap-1">
+                            <div className="flex items-center gap-0.5 mr-2">
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updateLayer(layer.id, { isBold: !layer.isBold });
+                                }}
+                                className={cn(
+                                  "p-1 rounded transition-all",
+                                  layer.isBold ? "bg-blue-600 text-white" : "text-slate-500 hover:text-slate-300"
+                                )}
+                              >
+                                <Bold size={12} />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updateLayer(layer.id, { isItalic: !layer.isItalic });
+                                }}
+                                className={cn(
+                                  "p-1 rounded transition-all",
+                                  layer.isItalic ? "bg-blue-600 text-white" : "text-slate-500 hover:text-slate-300"
+                                )}
+                              >
+                                <Italic size={12} />
+                              </button>
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  updateLayer(layer.id, { isUnderline: !layer.isUnderline });
+                                }}
+                                className={cn(
+                                  "p-1 rounded transition-all",
+                                  layer.isUnderline ? "bg-blue-600 text-white" : "text-slate-500 hover:text-slate-300"
+                                )}
+                              >
+                                <Underline size={12} />
+                              </button>
+                            </div>
                             {layer.type === 'date' && (
                               <div className="relative group/date">
                                 <button
