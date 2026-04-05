@@ -5,7 +5,6 @@ import fs from "fs";
 import multer from "multer";
 import pg from "pg";
 import { fileURLToPath } from "url";
-import { createClient } from "@supabase/supabase-js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,9 +15,10 @@ const app = express();
 // Force bypass for self-signed certificates globally
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
-// Use /tmp for writable storage on Vercel (fallback if DB not used)
+// Use /tmp for writable storage on Vercel/Netlify (fallback if DB not used)
 const IS_VERCEL = process.env.VERCEL === "1";
-const STORAGE_BASE = IS_VERCEL ? "/tmp" : process.cwd();
+const IS_NETLIFY = !!process.env.NETLIFY;
+const STORAGE_BASE = (IS_VERCEL || IS_NETLIFY) ? "/tmp" : process.cwd();
 const DATA_FILE = path.resolve(STORAGE_BASE, "data.json");
 
 const PROJECT_FONTS_DIR = [
@@ -32,12 +32,6 @@ const PROJECT_FONTS_DIR = [
 const WRITABLE_FONTS_DIR = path.resolve(STORAGE_BASE, "public", "fonts");
 const UPLOADS_DIR = path.resolve(STORAGE_BASE, "public", "uploads");
 
-// Supabase setup
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "";
-const supabase = (supabaseUrl && supabaseAnonKey) ? createClient(supabaseUrl, supabaseAnonKey) : null;
-const FONTS_BUCKET = "fonts";
-
 console.log(`__dirname: ${__dirname}`);
 console.log(`process.cwd(): ${process.cwd()}`);
 console.log(`Resolved PROJECT_FONTS_DIR: ${PROJECT_FONTS_DIR} (exists: ${fs.existsSync(PROJECT_FONTS_DIR)})`);
@@ -47,13 +41,10 @@ if (fs.existsSync(PROJECT_FONTS_DIR)) {
 
 // Database setup
 const HAS_POSTGRES = !!process.env.DATABASE_URL;
-const HAS_SUPABASE = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_ANON_KEY;
 
 if (HAS_POSTGRES) {
   const sanitizedUrl = process.env.DATABASE_URL!.replace(/:[^:@/]+@/, ':****@');
   console.log(`Postgres Database URL found: ${sanitizedUrl}`);
-} else if (HAS_SUPABASE) {
-  console.log("Supabase configured for database fallback");
 } else {
   console.log("No remote database configured, falling back to data.json");
 }
@@ -133,17 +124,6 @@ async function initDb() {
     } finally {
       if (client) client.release();
     }
-  } else if (HAS_SUPABASE) {
-    try {
-      console.log("Initializing Supabase database (checking tables)...");
-      // In Supabase, we assume tables are created via SQL editor or we can try to check/create them
-      // For now, we'll just mark as initialized and handle errors during queries
-      isDbInitialized = true;
-      dbInitError = null;
-    } catch (err) {
-      dbInitError = err instanceof Error ? err.message : String(err);
-      console.error("Supabase initialization error:", err);
-    }
   }
 }
 
@@ -189,7 +169,7 @@ app.get("/api/health", async (req, res) => {
   res.json({ 
     status: "ok", 
     time: new Date().toISOString(), 
-    environment: IS_VERCEL ? "vercel" : "local",
+    environment: IS_VERCEL ? "vercel" : (IS_NETLIFY ? "netlify" : "local"),
     database: {
       status: dbStatus,
       error: dbError,
@@ -250,27 +230,6 @@ app.post("/api/login", async (req, res) => {
           role: user.role,
           selectedFonts: user.selectedFonts || []
         });
-      }
-    } else if (HAS_SUPABASE) {
-      console.log("Using Supabase for login");
-      const { data, error } = await supabase
-        .from('users')
-        .select('username, role, selected_fonts')
-        .eq('username', username)
-        .eq('password', password)
-        .single();
-      
-      if (data) {
-        console.log(`Login successful for user: ${username} (Supabase)`);
-        return res.json({ 
-          success: true, 
-          username: data.username, 
-          role: data.role,
-          selectedFonts: data.selected_fonts || []
-        });
-      }
-      if (error && error.code !== 'PGRST116') {
-        console.error("Supabase login error:", error);
       }
     } else {
       console.log("Using data.json for login");
@@ -511,35 +470,11 @@ app.get("/api/debug-fs", (req, res) => {
 app.get("/api/fonts", async (req, res) => {
   res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   try {
-    // 1. Get local project fonts (pre-installed)
     const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
-    const projectFonts = projectFiles.map(f => ({ name: f, url: `/fonts/${f}` }));
-
-    // 2. Get Supabase fonts
-    let supabaseFonts: any[] = [];
-    if (supabase) {
-      const { data, error } = await supabase.storage.from(FONTS_BUCKET).list();
-      if (error) {
-        console.error("Supabase storage list error:", error);
-      } else if (data) {
-        supabaseFonts = data.map((f: any) => {
-          const { data: { publicUrl } } = supabase.storage.from(FONTS_BUCKET).getPublicUrl(f.name);
-          return { name: f.name, url: publicUrl };
-        });
-      }
-    }
-
-    // 3. Get local writable fonts (legacy/fallback)
     const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
-    const writableFonts = writableFiles.map(f => ({ name: f, url: `/fonts/${f}` }));
-
-    const allFonts = [...projectFonts, ...supabaseFonts, ...writableFonts];
-    
-    // De-duplicate by name
-    const uniqueFonts = Array.from(new Map(allFonts.map(f => [f.name, f])).values());
-
-    console.log(`Found ${projectFonts.length} project fonts and ${supabaseFonts.length} Supabase fonts. Total unique: ${uniqueFonts.length}`);
-    res.json(uniqueFonts);
+    const allFiles = Array.from(new Set([...projectFiles, ...writableFiles]));
+    console.log(`Found ${projectFiles.length} project fonts and ${writableFiles.length} writable fonts. Total unique: ${allFiles.length}`);
+    res.json(allFiles.map(f => ({ name: f, url: `/fonts/${f}` })));
   } catch (err) {
     console.error("Fetch fonts error:", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -553,28 +488,12 @@ app.post("/api/upload-font", upload.single("font"), async (req, res) => {
       return res.status(400).json({ success: false, message: "No file uploaded" });
     }
 
-    if (!supabase) {
-      return res.status(500).json({ success: false, message: "Supabase not configured. Please add SUPABASE_URL and SUPABASE_ANON_KEY to your environment variables." });
-    }
-
     const sanitized = file.originalname.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
     const fileName = `${Date.now()}-${sanitized}`;
+    const filePath = path.join(WRITABLE_FONTS_DIR, fileName);
 
-    const { data, error } = await supabase.storage
-      .from(FONTS_BUCKET)
-      .upload(fileName, file.buffer, {
-        contentType: file.mimetype,
-        upsert: true
-      });
-
-    if (error) {
-      console.error("Supabase upload error:", error);
-      return res.status(500).json({ success: false, message: error.message });
-    }
-
-    const { data: { publicUrl } } = supabase.storage.from(FONTS_BUCKET).getPublicUrl(fileName);
-
-    res.json({ success: true, url: publicUrl, name: fileName });
+    fs.writeFileSync(filePath, file.buffer);
+    res.json({ success: true, url: `/fonts/${fileName}`, name: fileName });
   } catch (err) {
     console.error("Upload font error:", err);
     res.status(500).json({ success: false, message: "Internal server error" });
@@ -584,42 +503,27 @@ app.post("/api/upload-font", upload.single("font"), async (req, res) => {
 app.delete("/api/fonts/:name", async (req, res) => {
   try {
     const { name } = req.params;
-
-    // 1. Try deleting from Supabase
-    if (supabase) {
-      // We need to find the full filename if 'name' is just the family name
-      const { data: files } = await supabase.storage.from(FONTS_BUCKET).list();
-      const fileToDelete = files?.find((f: any) => f.name === name || f.name.startsWith(name));
-      
-      if (fileToDelete) {
-        const { error } = await supabase.storage.from(FONTS_BUCKET).remove([fileToDelete.name]);
-        if (!error) return res.json({ success: true });
-        console.error("Supabase delete error:", error);
-      }
-    }
-
-    // 2. Fallback to local filesystem
     const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
     const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
     
-    let localFileToDelete = writableFiles.find(f => {
+    let fileToDelete = writableFiles.find(f => {
       const fontFamily = f.split('.').slice(0, -1).join('.');
       return fontFamily === name || f === name;
     });
 
-    if (localFileToDelete) {
-      fs.unlinkSync(path.join(WRITABLE_FONTS_DIR, localFileToDelete));
+    if (fileToDelete) {
+      fs.unlinkSync(path.join(WRITABLE_FONTS_DIR, fileToDelete));
       return res.json({ success: true });
     }
 
-    localFileToDelete = projectFiles.find(f => {
+    fileToDelete = projectFiles.find(f => {
       const fontFamily = f.split('.').slice(0, -1).join('.');
       return fontFamily === name || f === name;
     });
 
-    if (localFileToDelete) {
+    if (fileToDelete) {
       try {
-        fs.unlinkSync(path.join(PROJECT_FONTS_DIR, localFileToDelete));
+        fs.unlinkSync(path.join(PROJECT_FONTS_DIR, fileToDelete));
         return res.json({ success: true });
       } catch (e) {
         console.warn("Could not delete project font (likely read-only):", e);
@@ -636,57 +540,33 @@ app.delete("/api/fonts/:name", async (req, res) => {
 app.post("/api/fonts/rename", async (req, res) => {
   try {
     const { oldName, newName } = req.body;
-
-    // 1. Try renaming in Supabase (Copy + Delete)
-    if (supabase) {
-      const { data: files } = await supabase.storage.from(FONTS_BUCKET).list();
-      const fileToRename = files?.find((f: any) => f.name === oldName || f.name.startsWith(oldName));
-      
-      if (fileToRename) {
-        const ext = path.extname(fileToRename.name);
-        const timestamp = fileToRename.name.split('-')[0];
-        const newFileName = `${timestamp}-${newName}${ext}`;
-        
-        const { error: copyError } = await supabase.storage
-          .from(FONTS_BUCKET)
-          .copy(fileToRename.name, newFileName);
-          
-        if (!copyError) {
-          await supabase.storage.from(FONTS_BUCKET).remove([fileToRename.name]);
-          return res.json({ success: true });
-        }
-        console.error("Supabase rename (copy) error:", copyError);
-      }
-    }
-
-    // 2. Fallback to local filesystem
     const projectFiles = fs.existsSync(PROJECT_FONTS_DIR) ? fs.readdirSync(PROJECT_FONTS_DIR) : [];
     const writableFiles = fs.existsSync(WRITABLE_FONTS_DIR) ? fs.readdirSync(WRITABLE_FONTS_DIR) : [];
     
-    let localFileToRename = writableFiles.find(f => {
+    let fileToRename = writableFiles.find(f => {
       const fontFamily = f.split('.').slice(0, -1).join('.');
       return fontFamily === oldName || f === oldName;
     });
 
-    if (localFileToRename) {
-      const ext = path.extname(localFileToRename);
-      const timestamp = localFileToRename.split('-')[0];
+    if (fileToRename) {
+      const ext = path.extname(fileToRename);
+      const timestamp = fileToRename.split('-')[0];
       const newFileName = `${timestamp}-${newName}${ext}`;
-      fs.renameSync(path.join(WRITABLE_FONTS_DIR, localFileToRename), path.join(WRITABLE_FONTS_DIR, newFileName));
+      fs.renameSync(path.join(WRITABLE_FONTS_DIR, fileToRename), path.join(WRITABLE_FONTS_DIR, newFileName));
       return res.json({ success: true });
     }
 
-    localFileToRename = projectFiles.find(f => {
+    fileToRename = projectFiles.find(f => {
       const fontFamily = f.split('.').slice(0, -1).join('.');
       return fontFamily === oldName || f === oldName;
     });
 
-    if (localFileToRename) {
-      const ext = path.extname(localFileToRename);
-      const timestamp = localFileToRename.split('-')[0];
+    if (fileToRename) {
+      const ext = path.extname(fileToRename);
+      const timestamp = fileToRename.split('-')[0];
       const newFileName = `${timestamp}-${newName}${ext}`;
       try {
-        fs.renameSync(path.join(PROJECT_FONTS_DIR, localFileToRename), path.join(PROJECT_FONTS_DIR, newFileName));
+        fs.renameSync(path.join(PROJECT_FONTS_DIR, fileToRename), path.join(PROJECT_FONTS_DIR, newFileName));
         return res.json({ success: true });
       } catch (e) {
         console.warn("Could not rename project font (likely read-only):", e);
@@ -717,18 +597,6 @@ app.get("/api/images", async (req, res) => {
       
       const result = await pool.query(query, params);
       return res.json(result.rows);
-    } else if (HAS_SUPABASE) {
-      let query = supabase.from('font_app_images').select('id, username, image_url, layers, name, created_at');
-      if (username) {
-        query = query.eq('username', username);
-      }
-      const { data, error } = await query;
-      if (error) throw error;
-      return res.json(data.map(img => ({
-        ...img,
-        imageUrl: img.image_url,
-        createdAt: img.created_at
-      })));
     } else {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
       const userImages = username 
@@ -758,17 +626,6 @@ app.post("/api/images", async (req, res) => {
          name = EXCLUDED.name`,
         [project.id, project.username, project.imageUrl, JSON.stringify(project.layers), project.name]
       );
-    } else if (HAS_SUPABASE) {
-      const { error } = await supabase
-        .from('font_app_images')
-        .upsert({
-          id: project.id,
-          username: project.username,
-          image_url: project.imageUrl,
-          layers: project.layers,
-          name: project.name
-        });
-      if (error) throw error;
     } else {
       const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf-8"));
       const index = data.images.findIndex((img: any) => img.id === project.id);

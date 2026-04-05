@@ -6,7 +6,6 @@ import fs from "fs";
 import { fileURLToPath } from "url";
 import multer from "multer";
 import pg from "pg";
-import { createClient } from "@supabase/supabase-js";
 
 // Force bypass for self-signed certificates globally as a fallback
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
@@ -24,12 +23,6 @@ const FONTS_DIR = fs.existsSync(path.join(process.cwd(), "public", "fonts"))
 const WRITABLE_FONTS_DIR = FONTS_DIR;
 const UPLOADS_DIR = path.join(__dirname, "public", "uploads");
 
-// Supabase setup
-const supabaseUrl = process.env.SUPABASE_URL || "";
-const supabaseAnonKey = process.env.SUPABASE_ANON_KEY || "";
-const supabase = (supabaseUrl && supabaseAnonKey) ? createClient(supabaseUrl, supabaseAnonKey) : null;
-const FONTS_BUCKET = "fonts";
-
 // Ensure directories exist
 [FONTS_DIR, UPLOADS_DIR].forEach(dir => {
   if (!fs.existsSync(dir)) {
@@ -39,13 +32,10 @@ const FONTS_BUCKET = "fonts";
 
 // Database setup
 const HAS_POSTGRES = !!process.env.DATABASE_URL;
-const HAS_SUPABASE = !!process.env.SUPABASE_URL && !!process.env.SUPABASE_ANON_KEY;
 
 if (HAS_POSTGRES) {
   const sanitizedUrl = process.env.DATABASE_URL!.replace(/:[^:@/]+@/, ':****@');
   console.log(`Postgres Database URL found: ${sanitizedUrl}`);
-} else if (HAS_SUPABASE) {
-  console.log("Supabase configured for database fallback");
 } else {
   console.log("No remote database configured, falling back to data.json");
 }
@@ -113,9 +103,6 @@ async function initDb() {
     } finally {
       if (client) client.release();
     }
-  } else if (HAS_SUPABASE) {
-    console.log("Initializing Supabase database (checking tables)...");
-    // Tables assumed to exist or created via SQL editor
   }
 }
 
@@ -176,23 +163,6 @@ async function startServer() {
             username: user.username, 
             role: user.role,
             selectedFonts: user.selectedFonts || []
-          });
-        }
-      } else if (HAS_SUPABASE) {
-        const { data, error } = await supabase
-          .from('users')
-          .select('username, role, selected_fonts')
-          .eq('username', username)
-          .eq('password', password)
-          .single();
-        
-        if (data) {
-          console.log(`Login successful for user: ${username} (Supabase)`);
-          return res.json({ 
-            success: true, 
-            username: data.username, 
-            role: data.role,
-            selectedFonts: data.selected_fonts || []
           });
         }
       }
@@ -325,24 +295,12 @@ async function startServer() {
     }
   });
 
-  // Fonts
   app.get("/api/fonts", async (req, res) => {
     try {
       const projectFiles = fs.existsSync(FONTS_DIR) ? fs.readdirSync(FONTS_DIR) : [];
       const projectFonts = projectFiles.map(f => ({ name: f, url: `/fonts/${f}` }));
 
-      let supabaseFonts: any[] = [];
-      if (supabase) {
-        const { data, error } = await supabase.storage.from(FONTS_BUCKET).list();
-        if (data) {
-          supabaseFonts = data.map((f: any) => {
-            const { data: { publicUrl } } = supabase.storage.from(FONTS_BUCKET).getPublicUrl(f.name);
-            return { name: f.name, url: publicUrl };
-          });
-        }
-      }
-
-      const allFonts = [...projectFonts, ...supabaseFonts];
+      const allFonts = [...projectFonts];
       const uniqueFonts = Array.from(new Map(allFonts.map(f => [f.name, f])).values());
       res.json(uniqueFonts);
     } catch (err) {
@@ -356,19 +314,6 @@ async function startServer() {
       const file = req.file;
       if (!file) return res.status(400).json({ success: false, message: "No file uploaded" });
 
-      if (supabase) {
-        const sanitized = file.originalname.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
-        const fileName = `${Date.now()}-${sanitized}`;
-        const { data, error } = await supabase.storage.from(FONTS_BUCKET).upload(fileName, file.buffer, {
-          contentType: file.mimetype,
-          upsert: true
-        });
-        if (error) throw error;
-        const { data: { publicUrl } } = supabase.storage.from(FONTS_BUCKET).getPublicUrl(fileName);
-        return res.json({ success: true, url: publicUrl, name: fileName });
-      }
-
-      // Fallback to disk if no Supabase
       const sanitized = file.originalname.replace(/[^a-z0-9.]/gi, '_').toLowerCase();
       const fileName = `${Date.now()}-${sanitized}`;
       fs.writeFileSync(path.join(FONTS_DIR, fileName), file.buffer);
@@ -383,15 +328,6 @@ async function startServer() {
     try {
       const { name } = req.params;
       
-      if (supabase) {
-        const { data: files } = await supabase.storage.from(FONTS_BUCKET).list();
-        const fileToDelete = files?.find((f: any) => f.name === name || f.name.startsWith(name));
-        if (fileToDelete) {
-          await supabase.storage.from(FONTS_BUCKET).remove([fileToDelete.name]);
-          return res.json({ success: true });
-        }
-      }
-
       const files = fs.readdirSync(FONTS_DIR);
       const fileToDelete = files.find(f => {
         const fontFamily = f.split('.').slice(0, -1).join('.');
@@ -413,21 +349,6 @@ async function startServer() {
   app.post("/api/fonts/rename", async (req, res) => {
     try {
       const { oldName, newName } = req.body;
-
-      if (supabase) {
-        const { data: files } = await supabase.storage.from(FONTS_BUCKET).list();
-        const fileToRename = files?.find((f: any) => f.name === oldName || f.name.startsWith(oldName));
-        if (fileToRename) {
-          const ext = path.extname(fileToRename.name);
-          const timestamp = fileToRename.name.split('-')[0];
-          const newFileName = `${timestamp}-${newName}${ext}`;
-          const { error } = await supabase.storage.from(FONTS_BUCKET).copy(fileToRename.name, newFileName);
-          if (!error) {
-            await supabase.storage.from(FONTS_BUCKET).remove([fileToRename.name]);
-            return res.json({ success: true });
-          }
-        }
-      }
 
       const files = fs.readdirSync(FONTS_DIR);
       const fileToRename = files.find(f => {
@@ -464,16 +385,6 @@ async function startServer() {
         }
         const result = await pool.query(query, params);
         return res.json(result.rows);
-      } else if (supabase) {
-        let query = supabase.from('font_app_images').select('id, username, image_url, layers, name, created_at');
-        if (username) query = query.eq('username', username);
-        const { data, error } = await query;
-        if (error) throw error;
-        return res.json(data.map((img: any) => ({
-          ...img,
-          imageUrl: img.image_url,
-          createdAt: img.created_at
-        })));
       }
       res.json([]);
     } catch (err) {
@@ -497,11 +408,6 @@ async function startServer() {
            name = EXCLUDED.name`,
           [id, username, imageUrl, JSON.stringify(layers), name]
         );
-      } else if (supabase) {
-        const { error } = await supabase
-          .from('font_app_images')
-          .upsert({ id, username, image_url: imageUrl, layers, name });
-        if (error) throw error;
       }
       
       res.json({ success: true });
@@ -516,9 +422,6 @@ async function startServer() {
       const { id } = req.params;
       if (HAS_POSTGRES) {
         await pool.query("DELETE FROM font_app_images WHERE id = $1", [id]);
-      } else if (supabase) {
-        const { error } = await supabase.from('font_app_images').delete().eq('id', id);
-        if (error) throw error;
       }
       res.json({ success: true });
     } catch (err) {
